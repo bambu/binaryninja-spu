@@ -1,5 +1,7 @@
 from __future__ import print_function
 import struct
+from collections import namedtuple
+
 from binaryninja import (
     Architecture, RegisterInfo, InstructionInfo,
     core, InstructionTextToken,
@@ -8,7 +10,7 @@ from binaryninja import (
     TextToken, PossibleAddressToken,
 
     FunctionReturn, CallDestination, UnconditionalBranch,
-    TrueBranch, FalseBranch, IndirectBranch)
+    TrueBranch, FalseBranch, IndirectBranch, LowLevelILExpr, CallingConvention)
 
 
 EM_SPU = 23
@@ -58,8 +60,10 @@ def decode_RR(opcode):
 
 def decode_RRR(opcode):
     # OP, T, B, A, C
-    return IBITS(opcode, 0, 3), IBITS(opcode, 4, 10), IBITS(opcode, 11, 17), IBITS(opcode, 18, 24), IBITS(opcode, 25,
-                                                                                                          31)
+    return (
+        IBITS(opcode, 0, 3), IBITS(opcode, 4, 10), IBITS(opcode, 11, 17),
+        IBITS(opcode, 18, 24), IBITS(opcode, 25, 31)
+    )
 
 
 def decode_RI7(opcode):
@@ -103,6 +107,55 @@ registers = (
     tuple('sp{}'.format(d) for d in xrange(2, 128)) +
     tuple('ch{}'.format(d) for d in xrange(2, 128))
 )
+
+
+instruction_il = {
+    'ori': lambda il, addr, (_, imm, ra, rt): il.set_reg(
+        16, rt,
+        il.or_expr(16, il.reg(16, ra), il.const(16, imm))
+    ),
+    # TODO: Link part
+    'brsl': lambda il, addr, (_, imm, rt): il.call(il.const(4, imm)),
+    'br': lambda il, addr, (_, imm, rt): il.jump(il.const(4, imm << 2)),
+    'lqd': lambda il, addr, (_, imm, ra, rt): il.set_reg(
+        16, rt,
+        il.load(16, il.add(16, il.reg(16, ra), il.const(16, imm << 4))),
+    ),
+    'lqx': lambda il, addr, (_, ra, rb, rt): il.set_reg(
+        16, rt,
+        il.load(16, il.add(16, il.reg(16, ra), il.reg(16, rb))),
+    ),
+    'stqd': lambda il, addr, (_, imm, ra, rt): il.store(
+        8,
+        il.add(16, il.reg(16, ra), il.const(16, imm*0x10)),
+        il.reg(16, rt)
+    ),
+    'bi': lambda il, addr, (_, __, ___, rt): il.ret(il.reg(16, rt)),
+    'ai': lambda il, addr, (_, imm, ra, rt): il.set_reg(
+        16, rt,
+        il.add(16, il.reg(16, ra), il.const(4, imm))
+    ),
+    'il': lambda il, addr, (_, imm, rt): il.set_reg(
+        16, rt, il.sign_extend(4, il.const(2, imm))
+    ),
+    'ila': lambda il, addr, (_, imm, rt): il.set_reg(16, rt, il.const(16, imm)),
+    'a': lambda il, addr, (_, rb, ra, rt): il.set_reg(
+        4, rt,
+        il.add(16, il.reg(16, ra), il.reg(16, rb))
+    ),
+    'wrch': lambda il, addr, (_, imm, ra, rt): il.set_reg(16, ra, il.reg(16, rt)),
+
+    # 'shufb': lambda il, addr, decoded:,
+    # 'cwd': lambda il, addr, decoded:,
+    # '': lambda il, addr, decoded:
+}
+
+
+TwoImmediates = namedtuple('TwoImmediates', 'op_idx imm imm2')
+ImmediateRegister = namedtuple('ImmediateRegister', 'op_idx imm, rt')
+ImmediateTwoRegisters = namedtuple('ImmediateTwoRegisters', 'op_idx imm ra rt')
+ThreeRegisters = namedtuple('ThreeRegisters', 'op_idx imm ra rt')
+FourRegisters = namedtuple('FourRegisters', 'op_idx, rt, rb, ra, rc')
 
 
 class SPU(Architecture):
@@ -152,19 +205,26 @@ class SPU(Architecture):
             def __init__(self, name):
                 self.name = name
 
+            def decode(self):
+                raise NotImplementedError
+
+            def get_text(self):
+                raise NotImplementedError
+
         class idef_RR(idef):
             def decode(self, opcode, addr):
-                return decode_RR(opcode)
+                op, rb, ra, rt = decode_RR(opcode)
+                return ThreeRegisters(op, registers[rb], registers[ra], registers[rt])
 
             def get_text(self, opcode, addr):
                 _, rb, ra, rt = self.decode(opcode, addr)
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
-                    InstructionTextToken(RegisterToken, registers[rt]),
+                    InstructionTextToken(RegisterToken, rt),
                     SPU._comma_separator,
-                    InstructionTextToken(RegisterToken, registers[ra]),
+                    InstructionTextToken(RegisterToken, ra),
                     SPU._comma_separator,
-                    InstructionTextToken(RegisterToken, registers[rb]),
+                    InstructionTextToken(RegisterToken, rb),
                 )
 
         class idef_ROHROL(idef_RR):
@@ -183,7 +243,9 @@ class SPU(Architecture):
                 #         p.cmd.Op2.type = o_void
                 #         if val == 0:
                 #             p.cmd.Op1.type = o_void
-                return op, val, ra
+
+                rohrol_decoded = namedtuple('ROHROLDecoded', 'op_idx brinst brtarg')
+                return rohrol_decoded(op, val, registers[ra])
 
             def get_text(self, opcode, addr):
                 op, brinst, brtarg = self.decode(opcode, addr)
@@ -192,7 +254,7 @@ class SPU(Architecture):
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
                     InstructionTextToken(PossibleAddressToken, '{:#x}'.format(brinst), brinst),
                     SPU._comma_separator,
-                    InstructionTextToken(RegisterToken, registers[brtarg]),
+                    InstructionTextToken(RegisterToken, brtarg),
                 )
 
         class idef_R(idef_RR):
@@ -200,21 +262,21 @@ class SPU(Architecture):
                 self.name = name
                 self.noRA = noRA
 
-            def decode(self, opcode, addr):
-                op, rb, ra, rt = decode_RR(opcode)
-                return op, ra, rt
+            # def decode(self, opcode, addr):
+            #     op, rb, ra, rt = decode_RR(opcode)
+            #     return op, ra, rt
 
             def get_text(self, opcode, addr):
-                _, ra, rt = self.decode(opcode, addr)
+                _, _, ra, rt = self.decode(opcode, addr)
 
                 tokens = [InstructionTextToken(TextToken, '{:10s}'.format(self.name))]
                 if not self.noRA:
                     tokens.extend((
-                        InstructionTextToken(RegisterToken, registers[ra]),
+                        InstructionTextToken(RegisterToken, ra),
                         SPU._comma_separator
                     ))
 
-                tokens.append(InstructionTextToken(RegisterToken, registers[rt]))
+                tokens.append(InstructionTextToken(RegisterToken, rt))
                 return tokens
 
         class idef_SPR(idef):
@@ -228,16 +290,17 @@ class SPU(Architecture):
                 sa += self.offset
                 if self.swap:
                     rt, sa = sa, rt
-                return op, iii, sa, rt
+
+                return ImmediateTwoRegisters(op, iii, registers[sa], registers[rt])
 
             def get_text(self, opcode, addr):
                 _, _, sa, rt = self.decode(opcode, addr)
 
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
-                    InstructionTextToken(RegisterToken, registers[rt]),
+                    InstructionTextToken(RegisterToken, rt),
                     SPU._comma_separator,
-                    InstructionTextToken(RegisterToken, registers[sa]),
+                    InstructionTextToken(RegisterToken, sa),
                 )
 
         class idef_CH(idef_SPR):
@@ -250,11 +313,11 @@ class SPU(Architecture):
                 self.cbit = cbit
                 self.cf = 0
 
-            def decode(self, opcode, addr):
-                op, iii1, iii2, iii3 = decode_RR(opcode)
-                # if self.cbit and p.cmd.Op3.reg & 0x40 != 0:
-                #     iii1 &= ~0x40
-                return op
+            # def decode(self, opcode, addr):
+            #     op, iii1, iii2, iii3 = decode_RR(opcode)
+            #     # if self.cbit and p.cmd.Op3.reg & 0x40 != 0:
+            #     #     iii1 &= ~0x40
+            #     return op
 
             def get_text(self, opcode, addr):
                 # TODO: To add false targets or not to add.. that is the question
@@ -262,19 +325,21 @@ class SPU(Architecture):
 
         class idef_RRR(idef):
             def decode(self, opcode, addr):
-                return decode_RRR(opcode)
+                op, rt, rb, ra, rc = decode_RRR(opcode)
+                return FourRegisters(op, registers[rt], registers[rb],
+                                     registers[ra], registers[rc])
 
             def get_text(self, opcode, addr):
                 _, rt, rb, ra, rc = self.decode(opcode, addr)
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
-                    InstructionTextToken(RegisterToken, registers[rt]),
+                    InstructionTextToken(RegisterToken, rt),
                     SPU._comma_separator,
-                    InstructionTextToken(RegisterToken, registers[ra]),
+                    InstructionTextToken(RegisterToken, ra),
                     SPU._comma_separator,
-                    InstructionTextToken(RegisterToken, registers[rb]),
+                    InstructionTextToken(RegisterToken, rb),
                     SPU._comma_separator,
-                    InstructionTextToken(RegisterToken, registers[rc]),
+                    InstructionTextToken(RegisterToken, rc),
                 )
 
         class idef_Branch(idef_RR):
@@ -288,12 +353,12 @@ class SPU(Architecture):
                 tokens = [InstructionTextToken(TextToken, '{:10s}'.format(self.name))]
                 if not self.no2:
                     tokens.extend((
-                        InstructionTextToken(RegisterToken, registers[ra]),
+                        InstructionTextToken(RegisterToken, ra),
                         SPU._comma_separator,
-                        InstructionTextToken(RegisterToken, registers[rb])
+                        InstructionTextToken(RegisterToken, rb)
                     ))
 
-                tokens.append(InstructionTextToken(RegisterToken, registers[rt]))
+                tokens.append(InstructionTextToken(RegisterToken, rt))
                 return tokens
 
         class idef_RI7(idef):
@@ -305,15 +370,15 @@ class SPU(Architecture):
                 op, i7, ra, rt = decode_RI7(opcode)
                 if self.signed and i7 & 0x40:
                     i7 -= 0x80
-                return op, i7, ra, rt
+                return ImmediateTwoRegisters(op, i7, registers[ra], registers[rt])
 
             def get_text(self, opcode, addr):
-                op, i7, ra, rt = self.decode(opcode, addr)
+                _, i7, ra, rt = self.decode(opcode, addr)
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
-                    InstructionTextToken(RegisterToken, registers[rt]),
+                    InstructionTextToken(RegisterToken, rt),
                     SPU._comma_separator,
-                    InstructionTextToken(RegisterToken, registers[ra]),
+                    InstructionTextToken(RegisterToken, ra),
                     SPU._comma_separator,
                     InstructionTextToken(IntegerToken, '{:#x}'.format(i7), i7),
                 )
@@ -324,22 +389,24 @@ class SPU(Architecture):
                 self.bias = bias
                 # self.cf = CF_CHG1 | CF_USE2 | CF_USE3
 
-            def decode(self, p, opcode):
-                _, p.cmd.Op3.value, p.cmd.Op2.reg, p.cmd.Op1.reg = decode_RI8(opcode)
-                # p.cmd.Op1.type = p.cmd.Op2.type = o_reg
-                p.cmd.Op3.value = self.bias - p.cmd.Op3.value
-                # p.cmd.Op3.type = o_imm
+            def decode(self, opcode):
+                # TODO: Finish this one
+                op, i8, ra, rt = decode_RI8(opcode)
+                i8 = self.bias - i8
+
+                return ImmediateTwoRegisters(op, i8, registers[ra], registers[rt])
 
         class idef_RI7_ls(idef_RI7):
-            def decode(self, opcode, addr):
-                # _, p.cmd.Op2.addr, p.cmd.Op2.reg, p.cmd.Op1.reg = decode_RI7(opcode)
-                return decode_RI7(opcode)
-                # p.cmd.Op1.type = o_reg
-                # p.cmd.Op2.type = o_displ
-                # p.cmd.Op2.dtyp = dt_byte16
-                # if p.cmd.Op2.addr & 0x40:
-                #     p.cmd.Op2.addr -= 0x80
-                #     p.cmd.Op2.specval |= spu_processor_t.FL_SIGNED
+            pass
+            # def decode(self, opcode, addr):
+            #     # _, p.cmd.Op2.addr, p.cmd.Op2.reg, p.cmd.Op1.reg = decode_RI7(opcode)
+            #     return decode_RI7(opcode)
+            #     # p.cmd.Op1.type = o_reg
+            #     # p.cmd.Op2.type = o_displ
+            #     # p.cmd.Op2.dtyp = dt_byte16
+            #     # if p.cmd.Op2.addr & 0x40:
+            #     #     p.cmd.Op2.addr -= 0x80
+            #     #     p.cmd.Op2.specval |= spu_processor_t.FL_SIGNED
 
         class idef_RI10(idef):
             def __init__(self, name, signed=True):
@@ -351,10 +418,10 @@ class SPU(Architecture):
                 if self.signed:
                     if i10 & 0x200:
                         i10 -= 0x400
-                return op, i10, ra, rt
+                return ImmediateTwoRegisters(op, i10, registers[ra], registers[rt])
 
             def get_text(self, opcode, addr):
-                op, i10, ra, rt = self.decode(opcode, addr)
+                _, i10, ra, rt = self.decode(opcode, addr)
 
                 name = self.name
                 if i10 == 0 and name is 'ori':
@@ -362,9 +429,9 @@ class SPU(Architecture):
 
                 tokens = [
                     InstructionTextToken(TextToken, '{:10s}'.format(name)),
-                    InstructionTextToken(RegisterToken, registers[rt]),
+                    InstructionTextToken(RegisterToken, rt),
                     SPU._comma_separator,
-                    InstructionTextToken(RegisterToken, registers[ra])
+                    InstructionTextToken(RegisterToken, ra)
                 ]
 
                 if name is not 'lr':
@@ -400,14 +467,14 @@ class SPU(Architecture):
                 if self.signext and i16 & 0x8000:
                     i16 -= 0x10000
                 # self.fixRA()
-                return op, i16, rt
+                return ImmediateRegister(op, i16, registers[rt])
 
             def get_text(self, opcode, addr):
-                op, i16, rt = self.decode(opcode, addr)
+                _, i16, rt = self.decode(opcode, addr)
                 tokens = [InstructionTextToken(TextToken, '{:10s}'.format(self.name))]
                 if not self.noRA:
                     tokens.extend((
-                        InstructionTextToken(RegisterToken, registers[rt]),
+                        InstructionTextToken(RegisterToken, rt),
                         SPU._comma_separator
                     ))
                 tokens.append(InstructionTextToken(PossibleAddressToken, '{:#x}'.format(i16), i16))
@@ -417,7 +484,7 @@ class SPU(Architecture):
             def decode(self, opcode, addr):
                 op, i16, rt = idef_RI16.decode(self, opcode, addr)
                 i16 <<= 2
-                return op, i16, rt
+                return ImmediateRegister(op, i16, rt)
 
         class idef_RI16_rel(idef_RI16_abs):
             def decode(self, opcode, addr):
@@ -425,7 +492,7 @@ class SPU(Architecture):
                 i16 = (i16 << 2) + addr
                 if i16 & 0x40000:
                     i16 &= ~0x40000
-                return op, i16, rt
+                return ImmediateRegister(op, i16, rt)
 
             def get_text(self, opcode, addr):
                 _, i16, rt = self.decode(opcode, addr)
@@ -433,7 +500,7 @@ class SPU(Architecture):
                 tokens = [InstructionTextToken(TextToken, '{:10s}'.format(self.name))]
                 if not self.noRA:
                     tokens.extend((
-                        InstructionTextToken(RegisterToken, registers[rt]),
+                        InstructionTextToken(RegisterToken, rt),
                         SPU._comma_separator
                     ))
 
@@ -442,13 +509,14 @@ class SPU(Architecture):
 
         class idef_RI18(idef):
             def decode(self, opcode, addr):
-                return decode_RI18(opcode)
+                op, i18, rt = decode_RI18(opcode)
+                return ImmediateRegister(op, i18, registers[rt])
 
             def get_text(self, opcode, addr):
                 _, i18, rt = self.decode(opcode, addr)
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
-                    InstructionTextToken(RegisterToken, registers[rt]),
+                    InstructionTextToken(RegisterToken, rt),
                     SPU._comma_separator,
                     InstructionTextToken(PossibleAddressToken, '{:#x}'.format(i18), i18),
                 )
@@ -475,10 +543,10 @@ class SPU(Architecture):
                 else:
                     i16 <<= 2
 
-                return op, val, i16
+                return TwoImmediates(op, val, i16)
 
             def get_text(self, opcode, addr):
-                op, brinst, brtarg = self.decode(opcode, addr)
+                _, brinst, brtarg = self.decode(opcode, addr)
 
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
@@ -788,5 +856,26 @@ class SPU(Architecture):
         return instruction.get_text(opcode, addr), self.address_size
 
     def perform_get_instruction_low_level_il(self, data, addr, il):
-        # TODO: Add IL
+        instruction, opcode = self.retrieve_instruction(data)
+        if instruction is None:
+            return
+
+        il_func = instruction_il.get(instruction.name, None)
+        if il_func:
+            decoded = instruction.decode(opcode, addr)
+            lifted = il_func(il, addr, decoded)
+            if isinstance(lifted, LowLevelILExpr):
+                il.append(lifted)
+            else:
+                for llil in lifted:
+                    il.append(llil)
+        else:
+            il.append(il.unimplemented())
+
         return self.address_size
+
+
+class DefaultCallingConvention(CallingConvention):
+    name = 'default'
+    int_arg_regs = registers[3:75]
+    int_return_reg = 'r3'
