@@ -10,8 +10,9 @@ from binaryninja import (
     TextToken, PossibleAddressToken,
 
     FunctionReturn, CallDestination, UnconditionalBranch,
-    TrueBranch, FalseBranch, IndirectBranch, LowLevelILExpr, CallingConvention)
+    TrueBranch, FalseBranch, IndirectBranch, LowLevelILExpr, CallingConvention, LowLevelILLabel)
 
+__all__ = ['EM_SPU', 'SPU', 'DefaultCallingConvention']
 
 EM_SPU = 23
 
@@ -24,29 +25,6 @@ def BITS(val, high, low):
 # extract one bit
 def BIT(val, bit):
     return (val >> bit) & 1
-
-
-# sign extend b low bits in x
-# from "Bit Twiddling Hacks"
-def SIGNEXT(x, b):
-    m = 1 << (b - 1)
-    x &= (1 << b) - 1
-    return (x ^ m) - m
-
-
-# check if operand is register reg
-# def is_reg(op, reg):
-#     return op.type == o_reg and op.reg == reg
-
-
-# check if operand is immediate value val
-# def is_imm(op, val):
-#     return op.type == o_imm and op.value == val
-
-
-# is sp delta fixed by the user?
-# def is_fixed_spd(ea):
-#     return (get_aflags(ea) & AFL_FIXEDSPD) != 0
 
 
 def IBITS(val, high, low):
@@ -101,6 +79,27 @@ def decode_STOP(opcode):
     return IBITS(opcode, 0, 10), IBITS(opcode, 18, 31)
 
 
+def conditional_jump(il, cond, dest):
+    t = None
+    to_append = []
+    if il[dest].operation == core.LLIL_CONST:
+        t = il.get_label_for_address(Architecture['spu'], il[dest].value)
+
+    if t is None:
+        t = LowLevelILLabel()
+        indirect = True
+    else:
+        indirect = False
+
+    f = LowLevelILLabel()
+    to_append.append(il.if_expr(cond, t, f))
+    if indirect:
+        il.mark_label(t)
+        to_append.append(il.jump(dest))
+
+    il.mark_label(f)
+    return to_append
+
 registers = (
     ('lr', 'sp') +
     tuple('r{}'.format(d) for d in xrange(2, 128)) +
@@ -110,52 +109,164 @@ registers = (
 
 
 instruction_il = {
-    'ori': lambda il, addr, (_, imm, ra, rt): il.set_reg(
+    'and': lambda il, addr, (rb, ra, rt): il.set_reg(
+        16, rt,
+        il.and_expr(16, il.reg(16, ra), il.reg(16, rb))
+    ),
+    'andi': lambda il, addr, (imm, ra, rt): il.set_reg(
+        16, rt,
+        il.and_expr(16, il.reg(16, ra), il.sign_extend(4, il.const(4, imm)))
+    ),
+    'or': lambda il, addr, (rb, ra, rt): il.set_reg(
+        16, rt,
+        il.or_expr(16, il.reg(16, ra), il.reg(16, rb))
+    ),
+    'ori': lambda il, addr, (imm, ra, rt): il.set_reg(
         16, rt,
         il.or_expr(16, il.reg(16, ra), il.const(16, imm))
     ),
-    # TODO: Link part
-    'brsl': lambda il, addr, (_, imm, rt): il.call(il.const(4, imm)),
-    'br': lambda il, addr, (_, imm, rt): il.jump(il.const(4, imm << 2)),
-    'lqd': lambda il, addr, (_, imm, ra, rt): il.set_reg(
+    'shl': lambda il, addr, (rb, ra, rt): il.set_reg(
         16, rt,
-        il.load(16, il.add(16, il.reg(16, ra), il.const(16, imm << 4))),
+        il.shift_left(16, il.reg(16, ra), il.reg(16, rb))
     ),
-    'lqx': lambda il, addr, (_, ra, rb, rt): il.set_reg(
+    'shli': lambda il, addr, (imm, ra, rt): il.set_reg(
+        16, rt,
+        il.shift_left(16, il.reg(16, ra), il.const(16, imm))
+    ),
+    'bisl': lambda il, addr, (_, ra, rt): il.call(il.reg(4, ra)),
+    'brsl': lambda il, addr, (imm, rt): il.call(il.const(4, imm)),
+    'br': lambda il, addr, (imm, rt): il.jump(il.const(4, imm)),
+    'brz': lambda il, addr, (imm, rt): conditional_jump(
+        il,
+        il.compare_equal(4, il.reg(4, rt), il.const(4, 0)),
+        il.const(16, imm)
+    ),
+    'brhz': lambda il, addr, (imm, rt): conditional_jump(
+        il,
+        il.compare_equal(2, il.reg(2, rt), il.const(2, 0)),
+        il.const(16, imm)
+    ),
+    'brnz': lambda il, addr, (imm, rt): conditional_jump(
+        il,
+        il.compare_not_equal(4, il.reg(4, rt), il.const(4, 0)),
+        il.const(16, imm)
+    ),
+    'brhnz': lambda il, addr, (imm, rt): conditional_jump(
+        il,
+        il.compare_not_equal(2, il.reg(2, rt), il.const(2, 0)),
+        il.const(16, imm)
+    ),
+    'biz': lambda il, addr, (ra, rt): conditional_jump(
+        il,
+        il.compare_equal(4, il.reg(4, rt), il.const(4, 0)),
+        il.reg(4, ra)
+    ),
+    'bihz': lambda il, addr, (ra, rt): conditional_jump(
+        il,
+        il.compare_equal(2, il.reg(2, rt), il.const(2, 0)),
+        il.reg(4, ra)
+    ),
+    'binz': lambda il, addr, (ra, rt): conditional_jump(
+        il,
+        il.compare_not_equal(4, il.reg(4, rt), il.const(4, 0)),
+        il.reg(4, ra)
+    ),
+    'bihnz': lambda il, addr, (ra, rt): conditional_jump(
+        il,
+        il.compare_not_equal(2, il.reg(2, rt), il.const(2, 0)),
+        il.reg(4, ra)
+    ),
+    'lqa': lambda il, addr, (imm, rt): il.set_reg(
+        16, rt,
+        il.load(16, il.sign_extend(4, il.const(16, imm))),
+    ),
+    'lqd': lambda il, addr, (imm, ra, rt): il.set_reg(
+        16, rt,
+        il.load(16, il.add(16, il.reg(16, ra), il.const(16, imm))),
+    ),
+    'lqr': lambda il, addr, (imm, rt): il.set_reg(
+        16, rt,
+        il.load(16, il.sign_extend(4, il.const(16, imm)))
+    ),
+    'lqx': lambda il, addr, (ra, rb, rt): il.set_reg(
         16, rt,
         il.load(16, il.add(16, il.reg(16, ra), il.reg(16, rb))),
     ),
-    'stqd': lambda il, addr, (_, imm, ra, rt): il.store(
+    'stqd': lambda il, addr, (imm, ra, rt): il.store(
         8,
-        il.add(16, il.reg(16, ra), il.const(16, imm*0x10)),
+        il.add(16, il.reg(16, ra), il.const(16, imm)),
         il.reg(16, rt)
     ),
-    'bi': lambda il, addr, (_, __, ___, rt): il.ret(il.reg(16, rt)),
-    'ai': lambda il, addr, (_, imm, ra, rt): il.set_reg(
+    'stqx': lambda il, addr, (rb, ra, rt): il.store(
+        16,
+        il.add(16, il.reg(16, ra), il.reg(16, rb)),
+        il.reg(16, rt)
+    ),
+    'bi': lambda il, addr, (_, __, rt): il.ret(il.reg(16, rt)),
+    'ai': lambda il, addr, (imm, ra, rt): il.set_reg(
         16, rt,
         il.add(16, il.reg(16, ra), il.const(4, imm))
     ),
-    'il': lambda il, addr, (_, imm, rt): il.set_reg(
+    'il': lambda il, addr, (imm, rt): il.set_reg(
         16, rt, il.sign_extend(4, il.const(2, imm))
     ),
-    'ila': lambda il, addr, (_, imm, rt): il.set_reg(16, rt, il.const(16, imm)),
-    'a': lambda il, addr, (_, rb, ra, rt): il.set_reg(
+    'ila': lambda il, addr, (imm, rt): il.set_reg(16, rt, il.const(16, imm)),
+    'a': lambda il, addr, (rb, ra, rt): il.set_reg(
         4, rt,
         il.add(16, il.reg(16, ra), il.reg(16, rb))
     ),
-    'wrch': lambda il, addr, (_, imm, ra, rt): il.set_reg(16, ra, il.reg(16, rt)),
+    'wrch': lambda il, addr, (imm, ra, rt): il.set_reg(16, ra, il.reg(16, rt)),
+    'nop': lambda il, addr, (_): il.nop(),
+    'lnop': lambda il, addr, (_): il.nop(),
+    'sf': lambda il, addr, (rb, ra, rt): il.set_reg(
+        16, rt,
+        il.sub(16, il.reg(16, ra), il.reg(16, rb))
+    ),
+    'sfi': lambda il, addr, (imm, ra, rt): il.set_reg(
+        16, rt,
+        il.sub(16, il.reg(16, ra), il.const(4, imm))
+    ),
+    'xor': lambda il, addr, (rb, ra, rt): il.set_reg(
+        16, rt,
+        il.xor_expr(16, il.reg(16, ra), il.reg(16, rb))
+    ),
+    'rotqby': lambda il, addr, (rb, ra, rt): il.set_reg(
+        16, rt,
+        il.rotate_left(16, il.reg(16, ra), il.reg(2, rb))
+    ),
+    'rotqbyi': lambda il, addr, (imm, ra, rt): il.set_reg(
+        16, rt,
+        il.rotate_left(16, il.reg(16, ra), il.const(2, imm))
+    ),
+    'ceq': lambda il, addr, (rb, ra, rt): il.set_reg(
+        16, rt,
+        il.compare_equal(4, il.reg(16, ra), il.reg(16, rb))
+    ),
+    'ceqi': lambda il, addr, (imm, ra, rt): il.set_reg(
+        16, rt,
+        il.compare_equal(4, il.reg(16, ra), il.const(16, imm))
+    ),
+    'cgt': lambda il, addr, (rb, ra, rt): il.set_reg(
+        16, rt,
+        il.compare_unsigned_greater_than(4, il.reg(16, ra), il.reg(16, rb))
+    ),
+    'cgti': lambda il, addr, (imm, ra, rt): il.set_reg(
+        16, rt,
+        il.compare_unsigned_greater_than(4, il.reg(16, ra), il.const(16, imm))
+    ),
 
     # 'shufb': lambda il, addr, decoded:,
     # 'cwd': lambda il, addr, decoded:,
     # '': lambda il, addr, decoded:
+
 }
 
 
-TwoImmediates = namedtuple('TwoImmediates', 'op_idx imm imm2')
-ImmediateRegister = namedtuple('ImmediateRegister', 'op_idx imm, rt')
-ImmediateTwoRegisters = namedtuple('ImmediateTwoRegisters', 'op_idx imm ra rt')
-ThreeRegisters = namedtuple('ThreeRegisters', 'op_idx imm ra rt')
-FourRegisters = namedtuple('FourRegisters', 'op_idx, rt, rb, ra, rc')
+TwoImmediates = namedtuple('TwoImmediates', 'imm imm2')
+ImmediateRegister = namedtuple('ImmediateRegister', 'imm rt')
+ImmediateTwoRegisters = namedtuple('ImmediateTwoRegisters', 'imm ra rt')
+ThreeRegisters = namedtuple('ThreeRegisters', 'imm ra rt')
+FourRegisters = namedtuple('FourRegisters', 'rt rb ra rc')
 
 
 class SPU(Architecture):
@@ -193,6 +304,8 @@ class SPU(Architecture):
         'zs': ['z', 's']
     }
 
+    itable = [None] * 2048
+
     _comma_separator = InstructionTextToken(OperandSeparatorToken, ', ')
 
     def __init__(self, *args, **kwargs):
@@ -205,19 +318,19 @@ class SPU(Architecture):
             def __init__(self, name):
                 self.name = name
 
-            def decode(self):
+            def decode(self, opcode, addr):
                 raise NotImplementedError
 
-            def get_text(self):
+            def get_text(self, opcode, addr):
                 raise NotImplementedError
 
         class idef_RR(idef):
             def decode(self, opcode, addr):
                 op, rb, ra, rt = decode_RR(opcode)
-                return ThreeRegisters(op, registers[rb], registers[ra], registers[rt])
+                return ThreeRegisters(registers[rb], registers[ra], registers[rt])
 
             def get_text(self, opcode, addr):
-                _, rb, ra, rt = self.decode(opcode, addr)
+                rb, ra, rt = self.decode(opcode, addr)
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
                     InstructionTextToken(RegisterToken, rt),
@@ -244,11 +357,10 @@ class SPU(Architecture):
                 #         if val == 0:
                 #             p.cmd.Op1.type = o_void
 
-                rohrol_decoded = namedtuple('ROHROLDecoded', 'op_idx brinst brtarg')
-                return rohrol_decoded(op, val, registers[ra])
+                return ImmediateRegister(val, registers[ra])
 
             def get_text(self, opcode, addr):
-                op, brinst, brtarg = self.decode(opcode, addr)
+                brinst, brtarg = self.decode(opcode, addr)
 
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
@@ -262,12 +374,8 @@ class SPU(Architecture):
                 self.name = name
                 self.noRA = noRA
 
-            # def decode(self, opcode, addr):
-            #     op, rb, ra, rt = decode_RR(opcode)
-            #     return op, ra, rt
-
             def get_text(self, opcode, addr):
-                _, _, ra, rt = self.decode(opcode, addr)
+                _, ra, rt = self.decode(opcode, addr)
 
                 tokens = [InstructionTextToken(TextToken, '{:10s}'.format(self.name))]
                 if not self.noRA:
@@ -291,10 +399,10 @@ class SPU(Architecture):
                 if self.swap:
                     rt, sa = sa, rt
 
-                return ImmediateTwoRegisters(op, iii, registers[sa], registers[rt])
+                return ImmediateTwoRegisters(iii, registers[sa], registers[rt])
 
             def get_text(self, opcode, addr):
-                _, _, sa, rt = self.decode(opcode, addr)
+                _, sa, rt = self.decode(opcode, addr)
 
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
@@ -313,11 +421,11 @@ class SPU(Architecture):
                 self.cbit = cbit
                 self.cf = 0
 
-            # def decode(self, opcode, addr):
-            #     op, iii1, iii2, iii3 = decode_RR(opcode)
-            #     # if self.cbit and p.cmd.Op3.reg & 0x40 != 0:
-            #     #     iii1 &= ~0x40
-            #     return op
+            def decode(self, opcode, addr):
+                op, iii1, iii2, iii3 = decode_RR(opcode)
+                # if self.cbit and p.cmd.Op3.reg & 0x40 != 0:
+                #     iii1 &= ~0x40
+                return
 
             def get_text(self, opcode, addr):
                 # TODO: To add false targets or not to add.. that is the question
@@ -326,11 +434,11 @@ class SPU(Architecture):
         class idef_RRR(idef):
             def decode(self, opcode, addr):
                 op, rt, rb, ra, rc = decode_RRR(opcode)
-                return FourRegisters(op, registers[rt], registers[rb],
+                return FourRegisters(registers[rt], registers[rb],
                                      registers[ra], registers[rc])
 
             def get_text(self, opcode, addr):
-                _, rt, rb, ra, rc = self.decode(opcode, addr)
+                rt, rb, ra, rc = self.decode(opcode, addr)
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
                     InstructionTextToken(RegisterToken, rt),
@@ -348,7 +456,7 @@ class SPU(Architecture):
                 self.no2 = no2
 
             def get_text(self, opcode, addr):
-                _, rb, ra, rt = self.decode(opcode, addr)
+                rb, ra, rt = self.decode(opcode, addr)
 
                 tokens = [InstructionTextToken(TextToken, '{:10s}'.format(self.name))]
                 if not self.no2:
@@ -370,10 +478,10 @@ class SPU(Architecture):
                 op, i7, ra, rt = decode_RI7(opcode)
                 if self.signed and i7 & 0x40:
                     i7 -= 0x80
-                return ImmediateTwoRegisters(op, i7, registers[ra], registers[rt])
+                return ImmediateTwoRegisters(i7, registers[ra], registers[rt])
 
             def get_text(self, opcode, addr):
-                _, i7, ra, rt = self.decode(opcode, addr)
+                i7, ra, rt = self.decode(opcode, addr)
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
                     InstructionTextToken(RegisterToken, rt),
@@ -390,11 +498,10 @@ class SPU(Architecture):
                 # self.cf = CF_CHG1 | CF_USE2 | CF_USE3
 
             def decode(self, opcode):
-                # TODO: Finish this one
                 op, i8, ra, rt = decode_RI8(opcode)
                 i8 = self.bias - i8
 
-                return ImmediateTwoRegisters(op, i8, registers[ra], registers[rt])
+                return ImmediateTwoRegisters(i8, registers[ra], registers[rt])
 
         class idef_RI7_ls(idef_RI7):
             pass
@@ -418,10 +525,10 @@ class SPU(Architecture):
                 if self.signed:
                     if i10 & 0x200:
                         i10 -= 0x400
-                return ImmediateTwoRegisters(op, i10, registers[ra], registers[rt])
+                return ImmediateTwoRegisters(i10, registers[ra], registers[rt])
 
             def get_text(self, opcode, addr):
-                _, i10, ra, rt = self.decode(opcode, addr)
+                i10, ra, rt = self.decode(opcode, addr)
 
                 name = self.name
                 if i10 == 0 and name is 'ori':
@@ -442,18 +549,13 @@ class SPU(Architecture):
 
                 return tokens
 
-        # TODO: ri10_ls
         class idef_RI10_ls(idef_RI10):
-            pass
-            # def decode(self, p, opcode):
-            #     op, i10, ra, rt = decode_RI10(opcode)
-            #     # p.cmd.Op1.type = o_reg
-            #     # p.cmd.Op2.type = o_displ
-            #     ra <<= 4
-            #     # p.cmd.Op2.dtyp = dt_byte16
-            #     if ra & 0x2000:
-            #         ra -= 0x4000
-            #     return op, i10, ra, rt
+            def decode(self, opcode, addr):
+                op, i10, ra, rt = decode_RI10(opcode)
+                i10 <<= 4
+                if i10 & 0x2000:
+                    i10 -= 0x4000
+                return ImmediateTwoRegisters(i10, registers[ra], registers[rt])
 
         class idef_RI16(idef):
             def __init__(self, name, flags=0, noRA=False, isBranch=True, signext=False):
@@ -467,10 +569,10 @@ class SPU(Architecture):
                 if self.signext and i16 & 0x8000:
                     i16 -= 0x10000
                 # self.fixRA()
-                return ImmediateRegister(op, i16, registers[rt])
+                return ImmediateRegister(i16, registers[rt])
 
             def get_text(self, opcode, addr):
-                _, i16, rt = self.decode(opcode, addr)
+                i16, rt = self.decode(opcode, addr)
                 tokens = [InstructionTextToken(TextToken, '{:10s}'.format(self.name))]
                 if not self.noRA:
                     tokens.extend((
@@ -482,20 +584,20 @@ class SPU(Architecture):
 
         class idef_RI16_abs(idef_RI16):
             def decode(self, opcode, addr):
-                op, i16, rt = idef_RI16.decode(self, opcode, addr)
+                i16, rt = idef_RI16.decode(self, opcode, addr)
                 i16 <<= 2
-                return ImmediateRegister(op, i16, rt)
+                return ImmediateRegister(i16, rt)
 
         class idef_RI16_rel(idef_RI16_abs):
             def decode(self, opcode, addr):
-                op, i16, rt = idef_RI16.decode(self, opcode, addr)
+                i16, rt = idef_RI16.decode(self, opcode, addr)
                 i16 = (i16 << 2) + addr
                 if i16 & 0x40000:
                     i16 &= ~0x40000
-                return ImmediateRegister(op, i16, rt)
+                return ImmediateRegister(i16, rt)
 
             def get_text(self, opcode, addr):
-                _, i16, rt = self.decode(opcode, addr)
+                i16, rt = self.decode(opcode, addr)
 
                 tokens = [InstructionTextToken(TextToken, '{:10s}'.format(self.name))]
                 if not self.noRA:
@@ -510,10 +612,10 @@ class SPU(Architecture):
         class idef_RI18(idef):
             def decode(self, opcode, addr):
                 op, i18, rt = decode_RI18(opcode)
-                return ImmediateRegister(op, i18, registers[rt])
+                return ImmediateRegister(i18, registers[rt])
 
             def get_text(self, opcode, addr):
-                _, i18, rt = self.decode(opcode, addr)
+                i18, rt = self.decode(opcode, addr)
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
                     InstructionTextToken(RegisterToken, rt),
@@ -543,10 +645,10 @@ class SPU(Architecture):
                 else:
                     i16 <<= 2
 
-                return TwoImmediates(op, val, i16)
+                return TwoImmediates(val, i16)
 
             def get_text(self, opcode, addr):
-                _, brinst, brtarg = self.decode(opcode, addr)
+                brinst, brtarg = self.decode(opcode, addr)
 
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
@@ -557,18 +659,18 @@ class SPU(Architecture):
 
         class idef_stop(idef):
             def decode(self, opcode, addr):
-                op, t = decode_STOP(opcode)
+                _, t = decode_STOP(opcode)
                 # p.cmd.Op1.type = o_imm
                 # p.cmd.Op1.value = t
-                return op, t
+                return t
 
             def get_text(self, opcode, addr):
-                _, t = self.decode(opcode, addr)
+                # t = self.decode(opcode, addr)
                 return tuple()
 
         # End idef classes
 
-        self.itable_RI10 = {
+        itable_RI10 = {
             0x04: idef_RI10('ori'),
             0x05: idef_RI10('orhi'),
             0x06: idef_RI10('orbi'),
@@ -601,7 +703,7 @@ class SPU(Architecture):
         }
 
         # 11-bit opcodes (bits 0:10)
-        self.itable_RR = {
+        itable_RR = {
             0x000: idef_stop('stop'),
             0x001: idef_noops('lnop'),  # no regs
             0x002: idef_noops('sync', cbit=True),  # C/#C
@@ -727,7 +829,7 @@ class SPU(Architecture):
         }
 
         # 4-bit opcodes (bits 0:3)
-        self.itable_RRR = {
+        itable_RRR = {
             0x8: idef_RRR('selb'),
             0xb: idef_RRR('shufb'),
             0xc: idef_RRR('mpya'),
@@ -736,7 +838,7 @@ class SPU(Architecture):
             0xf: idef_RRR('fms'),
         }
 
-        self.itable_RI16 = {
+        itable_RI16 = {
             0x040: idef_RI16_rel('brz'),
             0x041: idef_RI16_abs('stqa', isBranch=False),
             0x042: idef_RI16_rel('brnz'),
@@ -756,7 +858,7 @@ class SPU(Architecture):
             0x0c1: idef_RI16('iohl'),
         }
 
-        self.itable_RI7 = {
+        itable_RI7 = {
             0x078: idef_RI7('roti'),
             0x079: idef_RI7('rotmi'),
             0x07a: idef_RI7('rotmai'),
@@ -777,22 +879,21 @@ class SPU(Architecture):
             0x3bf: idef_RI7('dftsv', signed=False),
         }
 
-        self.itable_RI18 = {
+        itable_RI18 = {
             0x21: idef_RI18('ila'),
             0x08: idef_I16RO('hbra'),  # roh/rol
             0x09: idef_I16RO('hbrr', rel=True),  # roh/rol
         }
 
         # 10-bit opcodes (bits 0:9)
-        self.itable_RI8 = {
+        itable_RI8 = {
             0x1d8: idef_RI8('cflts', 173),
             0x1d9: idef_RI8('cfltu', 173),
             0x1da: idef_RI8('csflt', 155),
             0x1db: idef_RI8('cuflt', 155),
         }
 
-        self.itable = [None] * 2048
-        for i in range(2048):
+        for i in xrange(2048):
             opcode = i << 21
             RR = decode_RR(opcode)
             RRR = decode_RRR(opcode)
@@ -802,13 +903,13 @@ class SPU(Architecture):
             RI16 = decode_RI16(opcode)
             RI18 = decode_RI18(opcode)
 
-            ins = self.itable_RR.get(RR[0])
-            ins = self.itable_RRR.get(RRR[0], ins)
-            ins = self.itable_RI7.get(RI7[0], ins)
-            ins = self.itable_RI8.get(RI8[0], ins)
-            ins = self.itable_RI10.get(RI10[0], ins)
-            ins = self.itable_RI16.get(RI16[0], ins)
-            ins = self.itable_RI18.get(RI18[0], ins)
+            ins = (itable_RR.get(RR[0], None) or
+                   itable_RRR.get(RRR[0], None) or
+                   itable_RI7.get(RI7[0], None) or
+                   itable_RI8.get(RI8[0], None) or
+                   itable_RI10.get(RI10[0], None) or
+                   itable_RI16.get(RI16[0], None) or
+                   itable_RI18.get(RI18[0], None))
 
             if ins:
                 self.itable[i] = ins
@@ -833,17 +934,17 @@ class SPU(Architecture):
         if inst_name in ('bi', 'iret'):
             result.add_branch(FunctionReturn)
         elif inst_name in ('brsl', 'brasl'):
-            _, branch_addr, _ = instruction.decode(opcode, addr)
+            branch_addr, _ = instruction.decode(opcode, addr)
             result.add_branch(CallDestination, branch_addr)
         elif inst_name == ('bisl', 'biz', 'binz', 'bihnz', 'bisled'):
-            _, _, ra, _ = instruction.decode(opcode, addr)
+            _, ra, _ = instruction.decode(opcode, addr)
             result.add_branch(IndirectBranch, ra)
         elif inst_name in ('brz', 'brnz', 'brhz', 'brhnz'):
-            _, branch_addr, _ = instruction.decode(opcode, addr)
+            branch_addr, _ = instruction.decode(opcode, addr)
             result.add_branch(TrueBranch, branch_addr)
             result.add_branch(FalseBranch, addr + self.address_size)
         elif inst_name in ('br', 'bra'):
-            _, branch_addr, _ = instruction.decode(opcode, addr)
+            branch_addr, _ = instruction.decode(opcode, addr)
             result.add_branch(UnconditionalBranch, branch_addr)
 
         return result
@@ -860,17 +961,14 @@ class SPU(Architecture):
         if instruction is None:
             return
 
-        il_func = instruction_il.get(instruction.name, None)
-        if il_func:
-            decoded = instruction.decode(opcode, addr)
-            lifted = il_func(il, addr, decoded)
-            if isinstance(lifted, LowLevelILExpr):
-                il.append(lifted)
-            else:
-                for llil in lifted:
-                    il.append(llil)
+        il_func = instruction_il.get(instruction.name, lambda *x: il.unimplemented())
+        decoded = instruction.decode(opcode, addr)
+        lifted = il_func(il, addr, decoded)
+        if isinstance(lifted, LowLevelILExpr):
+            il.append(lifted)
         else:
-            il.append(il.unimplemented())
+            for llil in lifted:
+                il.append(llil)
 
         return self.address_size
 
