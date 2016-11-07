@@ -10,10 +10,6 @@ To install this plugin, navigate to your Binary Ninja plugins directory, and run
 
 ```git clone https://github.com/bambu/binaryninja-spu.git spu```
 
-Then create a python file called `spu.py` with the contents
-
-```import spu```
-
 ## Minimum Version
 
 This plugin requires the following minimum version of Binary Ninja:
