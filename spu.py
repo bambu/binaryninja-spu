@@ -4,17 +4,31 @@ from collections import namedtuple
 
 from binaryninja import (
     Architecture, RegisterInfo, InstructionInfo,
-    core, InstructionTextToken,
+    InstructionTextToken, CallingConvention,
 
-    RegisterToken, IntegerToken, OperandSeparatorToken,
-    TextToken, PossibleAddressToken,
+    LowLevelILExpr, LowLevelILLabel)
 
-    FunctionReturn, CallDestination, UnconditionalBranch,
-    TrueBranch, FalseBranch, IndirectBranch, LowLevelILExpr, CallingConvention, LowLevelILLabel)
+from binaryninja.enums import (
+        FlagRole, LowLevelILFlagCondition,
+        InstructionTextTokenType, BranchType, LowLevelILOperation)
 
-__all__ = ['EM_SPU', 'SPU', 'DefaultCallingConvention']
+
+__all__ = ['EM_SPU', 'Spu', 'DefaultCallingConvention']
 
 EM_SPU = 23
+
+IntegerToken = InstructionTextTokenType.IntegerToken
+OperandSeparatorToken = InstructionTextTokenType.OperandSeparatorToken
+PossibleAddressToken = InstructionTextTokenType.PossibleAddressToken
+RegisterToken = InstructionTextTokenType.RegisterToken
+TextToken = InstructionTextTokenType.TextToken
+
+FunctionReturn = BranchType.FunctionReturn
+CallDestination = BranchType.CallDestination
+UnconditionalBranch = BranchType.UnconditionalBranch
+TrueBranch = BranchType.TrueBranch
+FalseBranch = BranchType.FalseBranch
+IndirectBranch = BranchType.IndirectBranch
 
 
 # extract bitfield occupying bits high..low from val (inclusive, start from 0)
@@ -81,8 +95,7 @@ def decode_STOP(opcode):
 
 def conditional_jump(il, cond, dest):
     t = None
-    to_append = []
-    if il[dest].operation == core.LLIL_CONST:
+    if il[dest].operation == LowLevelILOperation.LLIL_CONST:
         t = il.get_label_for_address(Architecture['spu'], il[dest].value)
 
     if t is None:
@@ -92,13 +105,13 @@ def conditional_jump(il, cond, dest):
         indirect = False
 
     f = LowLevelILLabel()
-    to_append.append(il.if_expr(cond, t, f))
+    il.append(il.if_expr(cond, t, f))
     if indirect:
         il.mark_label(t)
-        to_append.append(il.jump(dest))
+        il.append(il.jump(dest))
 
     il.mark_label(f)
-    return to_append
+    return None
 
 registers = (
     ('lr', 'sp') +
@@ -134,7 +147,10 @@ instruction_il = {
         il.shift_left(16, il.reg(16, ra), il.const(16, imm))
     ),
     'bisl': lambda il, addr, (_, ra, rt): il.call(il.reg(4, ra)),
-    'brsl': lambda il, addr, (imm, rt): il.call(il.const(4, imm)),
+    'brsl': lambda il, addr, (imm, rt): (
+        il.call(il.const(4, imm)),
+        il.set_reg(16, rt, il.const(16, addr + 4))
+    ),
     'br': lambda il, addr, (imm, rt): il.jump(il.const(4, imm)),
     'brz': lambda il, addr, (imm, rt): conditional_jump(
         il,
@@ -269,7 +285,7 @@ ThreeRegisters = namedtuple('ThreeRegisters', 'imm ra rt')
 FourRegisters = namedtuple('FourRegisters', 'rt rb ra rc')
 
 
-class SPU(Architecture):
+class Spu(Architecture):
     name = 'spu'
     address_size = 4
     default_int_size = 4
@@ -282,19 +298,19 @@ class SPU(Architecture):
     flags = ('c', 'z', 'i', 'd', 'b', 'v', 's')
     flag_write_types = ('*', 'czs', 'zvs', 'zs')
     flag_roles = {
-        'c': core.SpecialFlagRole,  # Not a normal carry flag, subtract result is inverted
-        'z': core.ZeroFlagRole,
-        'v': core.OverflowFlagRole,
-        's': core.NegativeSignFlagRole
+        'c': FlagRole.SpecialFlagRole,  # Not a normal carry flag, subtract result is inverted
+        'z': FlagRole.ZeroFlagRole,
+        'v': FlagRole.OverflowFlagRole,
+        's': FlagRole.NegativeSignFlagRole
     }
 
     flags_required_for_flag_condition = {
-        core.LLFC_UGE: ['c'],
-        core.LLFC_ULT: ['c'],
-        core.LLFC_E: ['z'],
-        core.LLFC_NE: ['z'],
-        core.LLFC_NEG: ['s'],
-        core.LLFC_POS: ['s']
+        LowLevelILFlagCondition.LLFC_UGE: ['c'],
+        LowLevelILFlagCondition.LLFC_ULT: ['c'],
+        LowLevelILFlagCondition.LLFC_E: ['z'],
+        LowLevelILFlagCondition.LLFC_NE: ['z'],
+        LowLevelILFlagCondition.LLFC_NEG: ['s'],
+        LowLevelILFlagCondition.LLFC_POS: ['s']
     }
 
     flags_written_by_flag_write_type = {
@@ -309,7 +325,7 @@ class SPU(Architecture):
     _comma_separator = InstructionTextToken(OperandSeparatorToken, ', ')
 
     def __init__(self, *args, **kwargs):
-        super(SPU, self).__init__(*args, **kwargs)
+        super(Spu, self).__init__(*args, **kwargs)
         self.init_instructions()
 
     def init_instructions(self):
@@ -334,9 +350,9 @@ class SPU(Architecture):
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
                     InstructionTextToken(RegisterToken, rt),
-                    SPU._comma_separator,
+                    Spu._comma_separator,
                     InstructionTextToken(RegisterToken, ra),
-                    SPU._comma_separator,
+                    Spu._comma_separator,
                     InstructionTextToken(RegisterToken, rb),
                 )
 
@@ -365,7 +381,7 @@ class SPU(Architecture):
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
                     InstructionTextToken(PossibleAddressToken, '{:#x}'.format(brinst), brinst),
-                    SPU._comma_separator,
+                    Spu._comma_separator,
                     InstructionTextToken(RegisterToken, brtarg),
                 )
 
@@ -381,7 +397,7 @@ class SPU(Architecture):
                 if not self.noRA:
                     tokens.extend((
                         InstructionTextToken(RegisterToken, ra),
-                        SPU._comma_separator
+                        Spu._comma_separator
                     ))
 
                 tokens.append(InstructionTextToken(RegisterToken, rt))
@@ -407,7 +423,7 @@ class SPU(Architecture):
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
                     InstructionTextToken(RegisterToken, rt),
-                    SPU._comma_separator,
+                    Spu._comma_separator,
                     InstructionTextToken(RegisterToken, sa),
                 )
 
@@ -442,11 +458,11 @@ class SPU(Architecture):
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
                     InstructionTextToken(RegisterToken, rt),
-                    SPU._comma_separator,
+                    Spu._comma_separator,
                     InstructionTextToken(RegisterToken, ra),
-                    SPU._comma_separator,
+                    Spu._comma_separator,
                     InstructionTextToken(RegisterToken, rb),
-                    SPU._comma_separator,
+                    Spu._comma_separator,
                     InstructionTextToken(RegisterToken, rc),
                 )
 
@@ -462,7 +478,7 @@ class SPU(Architecture):
                 if not self.no2:
                     tokens.extend((
                         InstructionTextToken(RegisterToken, ra),
-                        SPU._comma_separator,
+                        Spu._comma_separator,
                         InstructionTextToken(RegisterToken, rb)
                     ))
 
@@ -485,9 +501,9 @@ class SPU(Architecture):
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
                     InstructionTextToken(RegisterToken, rt),
-                    SPU._comma_separator,
+                    Spu._comma_separator,
                     InstructionTextToken(RegisterToken, ra),
-                    SPU._comma_separator,
+                    Spu._comma_separator,
                     InstructionTextToken(IntegerToken, '{:#x}'.format(i7), i7),
                 )
 
@@ -537,13 +553,13 @@ class SPU(Architecture):
                 tokens = [
                     InstructionTextToken(TextToken, '{:10s}'.format(name)),
                     InstructionTextToken(RegisterToken, rt),
-                    SPU._comma_separator,
+                    Spu._comma_separator,
                     InstructionTextToken(RegisterToken, ra)
                 ]
 
                 if name is not 'lr':
                     tokens.extend((
-                        SPU._comma_separator,
+                        Spu._comma_separator,
                         InstructionTextToken(IntegerToken, '{:#x}'.format(i10), i10)
                     ))
 
@@ -577,7 +593,7 @@ class SPU(Architecture):
                 if not self.noRA:
                     tokens.extend((
                         InstructionTextToken(RegisterToken, rt),
-                        SPU._comma_separator
+                        Spu._comma_separator
                     ))
                 tokens.append(InstructionTextToken(PossibleAddressToken, '{:#x}'.format(i16), i16))
                 return tokens
@@ -603,7 +619,7 @@ class SPU(Architecture):
                 if not self.noRA:
                     tokens.extend((
                         InstructionTextToken(RegisterToken, rt),
-                        SPU._comma_separator
+                        Spu._comma_separator
                     ))
 
                 tokens.append(InstructionTextToken(PossibleAddressToken, '{:#x}'.format(i16), i16))
@@ -619,7 +635,7 @@ class SPU(Architecture):
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
                     InstructionTextToken(RegisterToken, rt),
-                    SPU._comma_separator,
+                    Spu._comma_separator,
                     InstructionTextToken(PossibleAddressToken, '{:#x}'.format(i18), i18),
                 )
 
@@ -653,7 +669,7 @@ class SPU(Architecture):
                 return (
                     InstructionTextToken(TextToken, '{:10s}'.format(self.name)),
                     InstructionTextToken(PossibleAddressToken, '{:#x}'.format(brinst), brinst),
-                    SPU._comma_separator,
+                    Spu._comma_separator,
                     InstructionTextToken(PossibleAddressToken, '{:#x}'.format(brtarg), brtarg),
                 )
 
@@ -966,7 +982,7 @@ class SPU(Architecture):
         lifted = il_func(il, addr, decoded)
         if isinstance(lifted, LowLevelILExpr):
             il.append(lifted)
-        else:
+        elif lifted:
             for llil in lifted:
                 il.append(llil)
 
