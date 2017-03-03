@@ -1,11 +1,7 @@
 {
 	"plugin": {
 		"name": "SPU Cell Architecture Plugin",
-		"type": [
-			"core",
-			"ui",
-			"architecture"
-		],
+		"type": [ "architecture" ],
 		"api": "python2",
 		"description": "A disassembler for the SPU Cell architecture.",
 		"longdescription": "This plugin disassembles SPU assembly code. This plugin is based off of the SPU IDA plugin by Felix Domke.\n\nTo install this plugin, navigate to your Binary Ninja plugins directory, and run\n\n```git clone https://github.com/bambu/binaryninja-spu.git spu```",
