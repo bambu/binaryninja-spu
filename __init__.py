@@ -9,6 +9,6 @@ __version__ = '0.0.1'
 
 Spu.register()
 arch = Architecture['spu']
-arch.register_calling_convention(DefaultCallingConvention(arch))
+arch.register_calling_convention(DefaultCallingConvention(arch, 'default'))
 
 BinaryViewType['ELF'].register_arch(EM_SPU, Endianness.BigEndian, arch)
