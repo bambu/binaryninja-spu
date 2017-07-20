@@ -96,7 +96,7 @@ def decode_STOP(opcode):
 def conditional_jump(il, cond, dest):
     t = None
     if il[dest].operation == LowLevelILOperation.LLIL_CONST:
-        t = il.get_label_for_address(Architecture['spu'], il[dest].value)
+        t = il.get_label_for_address(Architecture['spu'], il[dest].constant)
 
     if t is None:
         t = LowLevelILLabel()
